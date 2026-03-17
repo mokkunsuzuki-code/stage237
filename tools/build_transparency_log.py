@@ -1,179 +1,182 @@
-#!/usr/bin/env python3
-# MIT License © 2025 Motohiro Suzuki
-
-from __future__ import annotations
-
 import argparse
 import hashlib
 import json
-import sys
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
-
-# Ensure project root is importable when running:
-# python3 tools/build_transparency_log.py
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from crypto.merkle import (  # noqa: E402
-    build_merkle_levels,
-    hash_leaf,
-    inclusion_proof,
-    levels_as_hex,
-    merkle_root,
-)
 
 
-def canonical_json_bytes(obj: Dict[str, Any]) -> bytes:
-    return json.dumps(
-        obj,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def hash_leaf(entry: dict) -> str:
+    canonical = json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return sha256_hex(canonical)
 
 
-def collect_files(input_dir: Path) -> List[Path]:
-    files = [p for p in input_dir.rglob("*") if p.is_file()]
-    return sorted(files, key=lambda p: str(p).replace("\\", "/"))
+def hash_pair(left_hex: str, right_hex: str) -> str:
+    return sha256_hex(bytes.fromhex(left_hex) + bytes.fromhex(right_hex))
 
 
-def safe_filename(rel_path: str) -> str:
-    return rel_path.replace("/", "__").replace("\\", "__")
+def build_merkle_tree(leaf_hashes: list[str]) -> list[list[str]]:
+    if not leaf_hashes:
+        return [["0" * 64]]
+
+    levels = [leaf_hashes]
+    current = leaf_hashes
+
+    while len(current) > 1:
+        nxt = []
+        for i in range(0, len(current), 2):
+            left = current[i]
+            right = current[i + 1] if i + 1 < len(current) else current[i]
+            nxt.append(hash_pair(left, right))
+        levels.append(nxt)
+        current = nxt
+
+    return levels
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Build transparency log + Merkle tree + inclusion proofs from a directory."
-    )
-    parser.add_argument(
-        "--input-dir",
-        default="out/evidence_bundle",
-        help="Directory containing evidence files (default: out/evidence_bundle)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="out/transparency",
-        help="Output directory (default: out/transparency)",
-    )
+def build_inclusion_proof(levels: list[list[str]], index: int) -> list[dict]:
+    proof = []
+    idx = index
+
+    for level in levels[:-1]:
+        if idx % 2 == 0:
+            sibling_index = idx + 1 if idx + 1 < len(level) else idx
+            sibling_position = "right"
+        else:
+            sibling_index = idx - 1
+            sibling_position = "left"
+
+        proof.append(
+            {
+                "sibling_hash": level[sibling_index],
+                "sibling_position": sibling_position,
+            }
+        )
+        idx //= 2
+
+    return proof
+
+
+def should_skip(path: Path, output_dir: Path) -> bool:
+    path_str = path.as_posix()
+
+    if str(path).startswith(str(output_dir)):
+        return True
+
+    skip_prefixes = [
+        "out/transparency/",
+        "out/checkpoint/",
+    ]
+    for prefix in skip_prefixes:
+        if path_str.startswith(prefix):
+            return True
+
+    return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build transparency log, Merkle tree, and inclusion proofs")
+    parser.add_argument("--input-dir", required=True, help="Input directory")
+    parser.add_argument("--output-dir", required=True, help="Output directory")
     args = parser.parse_args()
 
-    input_dir = (PROJECT_ROOT / args.input_dir).resolve()
-    output_dir = (PROJECT_ROOT / args.output_dir).resolve()
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
     proofs_dir = output_dir / "inclusion_proofs"
-
-    if not input_dir.exists():
-        raise SystemExit(f"[ERROR] input directory not found: {input_dir}")
-
-    files = collect_files(input_dir)
-    if not files:
-        raise SystemExit(f"[ERROR] no files found under: {input_dir}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     proofs_dir.mkdir(parents=True, exist_ok=True)
 
-    entries: List[Dict[str, Any]] = []
-    leaf_hashes = []
+    entries = []
+    files = []
 
-    for index, file_path in enumerate(files):
-        rel_path = str(file_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
-        file_sha256 = sha256_file(file_path)
-        size_bytes = file_path.stat().st_size
+    for path in sorted(input_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if should_skip(path, output_dir):
+            continue
 
-        entry_core = {
-            "index": index,
-            "path": rel_path,
-            "sha256": file_sha256,
-            "size_bytes": size_bytes,
+        rel_path = path.relative_to(Path.cwd()) if path.is_absolute() else path
+        data = path.read_bytes()
+        file_hash = sha256_hex(data)
+
+        entry = {
+            "path": rel_path.as_posix(),
+            "sha256": file_hash,
+            "size": len(data),
         }
-        entry_bytes = canonical_json_bytes(entry_core)
-        leaf_hash_hex = hash_leaf(entry_bytes).hex()
-
-        entry = dict(entry_core)
-        entry["leaf_hash"] = leaf_hash_hex
-
         entries.append(entry)
-        leaf_hashes.append(bytes.fromhex(leaf_hash_hex))
+        files.append(path)
 
-    levels = build_merkle_levels(leaf_hashes)
-    root_hex = merkle_root(levels).hex()
-
-    generated_at = datetime.now(timezone.utc).isoformat()
-
-    log_doc = {
-        "schema_version": "stage216.transparency_log.v1",
-        "generated_at_utc": generated_at,
-        "leaf_hash_definition": "SHA256(0x00 || canonical_json(entry))",
-        "node_hash_definition": "SHA256(0x01 || left || right)",
+    transparency_log = {
+        "version": "1.0",
+        "type": "transparency_log",
         "entry_count": len(entries),
-        "merkle_root": root_hex,
         "entries": entries,
     }
 
-    tree_doc = {
-        "schema_version": "stage216.merkle_tree.v1",
-        "generated_at_utc": generated_at,
-        "entry_count": len(entries),
-        "merkle_root": root_hex,
-        "levels": levels_as_hex(levels),
+    leaf_hashes = [hash_leaf(entry) for entry in entries]
+    levels = build_merkle_tree(leaf_hashes)
+    merkle_root = levels[-1][0]
+
+    merkle_tree = {
+        "version": "1.0",
+        "leaf_count": len(leaf_hashes),
+        "merkle_root": merkle_root,
+        "levels": levels,
     }
-
-    (output_dir / "transparency_log.json").write_text(
-        json.dumps(log_doc, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    (output_dir / "merkle_tree.json").write_text(
-        json.dumps(tree_doc, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    (output_dir / "root.txt").write_text(root_hex + "\n", encoding="utf-8")
-
-    for entry in entries:
-        proof_doc = {
-            "schema_version": "stage216.inclusion_proof.v1",
-            "generated_at_utc": generated_at,
-            "merkle_root": root_hex,
-            "entry": entry,
-            "proof": inclusion_proof(entry["index"], levels),
-        }
-        out_name = safe_filename(entry["path"]) + ".proof.json"
-        (proofs_dir / out_name).write_text(
-            json.dumps(proof_doc, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
 
     checkpoint = {
-        "schema_version": "stage216.checkpoint.v1",
-        "generated_at_utc": generated_at,
-        "input_dir": str(input_dir),
-        "output_dir": str(output_dir),
+        "version": "1.0",
+        "type": "transparency_checkpoint",
         "entry_count": len(entries),
-        "merkle_root": root_hex,
-        "log_path": str(output_dir / "transparency_log.json"),
-        "tree_path": str(output_dir / "merkle_tree.json"),
-        "proofs_dir": str(proofs_dir),
+        "merkle_root": merkle_root,
     }
-    (output_dir / "checkpoint.json").write_text(
+
+    transparency_log_path = output_dir / "transparency_log.json"
+    merkle_tree_path = output_dir / "merkle_tree.json"
+    root_txt_path = output_dir / "root.txt"
+    checkpoint_path = output_dir / "checkpoint.json"
+
+    transparency_log_path.write_text(
+        json.dumps(transparency_log, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    merkle_tree_path.write_text(
+        json.dumps(merkle_tree, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    root_txt_path.write_text(merkle_root + "\n", encoding="utf-8")
+    checkpoint_path.write_text(
         json.dumps(checkpoint, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
 
-    print(f"[OK] wrote: {output_dir / 'transparency_log.json'}")
-    print(f"[OK] wrote: {output_dir / 'merkle_tree.json'}")
-    print(f"[OK] wrote: {output_dir / 'root.txt'}")
-    print(f"[OK] wrote: {output_dir / 'checkpoint.json'}")
+    for i, entry in enumerate(entries):
+        proof = {
+            "version": "1.0",
+            "type": "inclusion_proof",
+            "entry": entry,
+            "leaf_hash": leaf_hashes[i],
+            "merkle_root": merkle_root,
+            "proof": build_inclusion_proof(levels, i),
+        }
+
+        safe_name = entry["path"].replace("/", "__")
+        proof_path = proofs_dir / f"{safe_name}.proof.json"
+        proof_path.write_text(
+            json.dumps(proof, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    print(f"[OK] wrote: {transparency_log_path}")
+    print(f"[OK] wrote: {merkle_tree_path}")
+    print(f"[OK] wrote: {root_txt_path}")
+    print(f"[OK] wrote: {checkpoint_path}")
     print(f"[OK] wrote proofs: {proofs_dir}")
-    print(f"[OK] merkle_root: {root_hex}")
+    print(f"[OK] merkle_root: {merkle_root}")
     print(f"[OK] entry_count: {len(entries)}")
 
 
