@@ -17,7 +17,10 @@ def sha256_file(path: Path) -> str:
 
 def write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def build_evidence_for_log(log_path: Path, output_dir: Path) -> dict:
@@ -32,7 +35,7 @@ def build_evidence_for_log(log_path: Path, output_dir: Path) -> dict:
         "sha256": digest,
         "size_bytes": log_path.stat().st_size,
         "line_count": line_count,
-        "status": "fixed_as_evidence",
+        "status": "unsigned",
     }
 
     evidence_name = log_path.stem + ".evidence.json"
